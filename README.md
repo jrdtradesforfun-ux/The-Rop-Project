@@ -7,7 +7,8 @@ Core ML-powered trading engine with MetaTrader 5 integration.
 - **ML Trading Models**: LSTM/GRU price predictors and trend analysis
 - **Risk Management**: Position sizing, stop loss, take profit automation  
 - **Position Management**: Track open positions and P&L in real-time
-- **MQL5 Integration**: Socket-based communication with MT5 Expert Advisors
+- **MQL5 Integration**: Socket-based communication with MT5 Expert Advisors (simple connector)
+- **PyTrader API Support**: Optional advanced connector supporting MT4/MT5 via licensed EA, instrument lists, tick/bar retrieval, and full order management
 - **Data Processing**: Technical indicators, feature engineering, normalization
 - **Logging**: Comprehensive logging with file rotation
 

@@ -137,11 +137,34 @@ Signal response structure:
 
 ## MT5 Integration
 
-The backend communicates with MT5 Expert Advisors via JSON over sockets.
+The backend communicates with MT5 Expert Advisors via JSON over sockets using `MQL5Connector`.
 
 1. Ensure MT5 EA is running and listening on configured port
 2. EA will receive buy/sell orders from the backend
 3. Backend monitors order executions and updates positions
+
+### Pytrader API Integration
+
+For full market coverage (MT4 & MT5) and advanced data/order features, the `PytraderConnector` provides a wrapper around the Pytrader API.  
+It requires the proprietary Pytrader license EA to be deployed on the MetaTrader terminal.
+
+**Usage example:**
+
+```python
+from jaredis_backend.mql5_bridge import PytraderConnector
+
+connector = PytraderConnector(host="localhost", port=5000, license_type="Demo")
+if connector.connect():
+    instruments = connector.get_instruments()
+    tick = connector.get_last_tick("EURUSD")
+    account = connector.get_account_info()
+    order = connector.open_order("EURUSD", "buy", volume=0.1, price=1.0950)
+    connector.close_position(order.get("ticket"))
+```
+
+The connector exposes comprehensive API methods such as `Get_broker_instrument_names`, `Get_last_x_bars_from_now`, `Open_order`, `Close_position_by_ticket`, etc., enabling trading across all markets supported by the terminal.
+
+This package incorporates the Pytrader API code directly under `jaredis_backend/pytrader/api.py`.
 
 ## Logging
 

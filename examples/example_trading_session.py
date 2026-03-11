@@ -5,7 +5,7 @@ Example: Running the complete trading backend
 import time
 from jaredis_backend.trading_engine import TradingEngine
 from jaredis_backend.ml_models import ModelManager, TrendAnalyzer
-from jaredis_backend.mql5_bridge import MQL5Connector, SignalCommunicator
+from jaredis_backend.mql5_bridge import MQL5Connector, SignalCommunicator, PytraderConnector
 from jaredis_backend.data_processing import DataLoader, FeatureEngineer
 from jaredis_backend.utils import setup_logging
 from examples.strategies import SimpleMomentumStrategy, MeanReversionStrategy
@@ -32,15 +32,23 @@ def run_trading_session():
     
     logger.info("Strategies registered")
     
-    # Try to connect to MQL5
-    mql5_connector = MQL5Connector(host="localhost", port=5000)
-    
-    if mql5_connector.connect():
-        logger.info("Connected to MQL5")
-        signal_comm = SignalCommunicator(mql5_connector)
-    else:
-        logger.warning("Could not connect to MQL5 (EA not running)")
-        signal_comm = None
+    # Try to connect using the Pytrader API (preferred if available)
+    try:
+        pyr = PytraderConnector(host="localhost", port=5000)
+        if pyr.connect():
+            logger.info("Connected to platform via Pytrader")
+            signal_comm = SignalCommunicator(pyr)  # still reuse signal communicator if needed
+        else:
+            raise RuntimeError("Pytrader connection failed")
+    except Exception:
+        logger.warning("Falling back to basic MQL5Connector")
+        mql5_connector = MQL5Connector(host="localhost", port=5000)
+        if mql5_connector.connect():
+            logger.info("Connected to MQL5")
+            signal_comm = SignalCommunicator(mql5_connector)
+        else:
+            logger.warning("Could not connect to MQL5 (EA not running)")
+            signal_comm = None
     
     # Simulation loop (in production, this would be real-time)
     logger.info("Starting main trading loop...")
