@@ -1,6 +1,13 @@
 """
-JustMarkets Broker Integration
-Connects to broker through MetaTrader via PyTrader API
+Universal Broker Integration
+Connects to ANY MetaTrader 5 compatible broker via PyTrader API
+
+Works with:
+- JustMarkets
+- IC Markets
+- Pepperstone
+- XM
+- Any MT5 broker
 """
 
 from typing import Dict, Any, Optional, List
@@ -12,34 +19,45 @@ from ..mql5_bridge import PytraderConnector
 logger = logging.getLogger(__name__)
 
 
-class JustMarketsBroker:
+class UniversalBroker:
     """
-    JustMarkets broker connector via MetaTrader.
-    
+    Universal broker connector for ANY MetaTrader 5 compatible broker.
+
     Setup:
-    1. Create demo account at JustMarkets
+    1. Create demo/live account at your preferred broker
     2. Install MetaTrader 5
-    3. Login to JustMarkets account in MT5
-    4. Deploy PyTrader EA in MT5
+    3. Login to your broker account in MT5
+    4. Deploy JaredisSmartEA.mq5 in MT5
     5. Run this connector
+
+    Supported Brokers:
+    - JustMarkets
+    - IC Markets
+    - Pepperstone
+    - XM
+    - Admiral Markets
+    - Any MT5 broker
     """
 
     def __init__(
         self,
         host: str = "localhost",
         port: int = 5000,
+        broker_name: str = "Universal",
         account_type: str = "Demo",
     ):
         """
-        Initialize broker connector.
-        
+        Initialize universal broker connector.
+
         Args:
             host: MT5 server host (localhost if local, or VPS IP for live)
             port: EA socket port
+            broker_name: Name of your broker (for logging)
             account_type: "Demo" or "Live"
         """
         self.host = host
         self.port = port
+        self.broker_name = broker_name
         self.account_type = account_type
         self.connector = PytraderConnector(
             host=host,
@@ -47,7 +65,6 @@ class JustMarketsBroker:
             license_type=account_type,
         )
         self.connected = False
-        self.broker_name = "JustMarkets"
 
     def connect(self) -> bool:
         """Establish connection to broker via MetaTrader"""

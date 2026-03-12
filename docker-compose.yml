@@ -1,0 +1,173 @@
+version: '3.8'
+
+services:
+  # Main trading bot
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: jaredis-trading-bot
+    restart: unless-stopped
+    environment:
+      - MT5_LOGIN=${MT5_LOGIN}
+      - MT5_PASSWORD=${MT5_PASSWORD}
+      - MT5_SERVER=${MT5_SERVER}
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=INFO
+      - ENV=production
+    volumes:
+      - ./models:/app/models:ro
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    depends_on:
+      - redis
+      - mlflow
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Prefect Server for MLops
+  prefect-server:
+    image: prefecthq/prefect:2-latest
+    container_name: prefect-server
+    command: prefect server start --host 0.0.0.0
+    ports:
+      - "4200:4200"
+    environment:
+      - PREFECT_SERVER_API_HOST=0.0.0.0
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://prefect:prefect@postgres-prefect:5432/prefect
+    depends_on:
+      - postgres-prefect
+    volumes:
+      - prefect-data:/root/.prefect
+    networks:
+      - trading-network
+
+  # Prefect Agent (runs ML training flows)
+  prefect-agent:
+    image: prefecthq/prefect:2-latest
+    container_name: prefect-agent
+    command: prefect agent start -q ml-training
+    environment:
+      - PREFECT_API_URL=http://prefect-server:4200/api
+    depends_on:
+      - prefect-server
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./pipelines:/pipelines
+      - ./models:/models
+    working_dir: /pipelines
+    networks:
+      - trading-network
+
+  # MLflow Model Registry
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    container_name: mlflow-server
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:mlflow@postgres-mlflow:5432/mlflow
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    depends_on:
+      - postgres-mlflow
+    networks:
+      - trading-network
+
+  # PostgreSQL for Prefect
+  postgres-prefect:
+    image: postgres:15-alpine
+    container_name: postgres-prefect
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=prefect
+      - POSTGRES_PASSWORD=prefect
+      - POSTGRES_DB=prefect
+    volumes:
+      - postgres-prefect-data:/var/lib/postgresql/data
+    networks:
+      - trading-network
+
+  # PostgreSQL for MLflow
+  postgres-mlflow:
+    image: postgres:15-alpine
+    container_name: postgres-mlflow
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=mlflow
+      - POSTGRES_PASSWORD=mlflow
+      - POSTGRES_DB=mlflow
+    volumes:
+      - postgres-mlflow-data:/var/lib/postgresql/data
+    networks:
+      - trading-network
+
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: jaredis-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - trading-network
+
+  # Grafana for monitoring dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: jaredis-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - trading-network
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: jaredis-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - trading-network
+
+volumes:
+  postgres-prefect-data:
+  postgres-mlflow-data:
+  mlflow-artifacts:
+  redis-data:
+  grafana-data:
+  prometheus-data:
+  prefect-data:
+
+networks:
+  trading-network:
+    driver: bridge

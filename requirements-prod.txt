@@ -1,0 +1,57 @@
+# Production dependencies
+
+# Data processing
+numpy==1.24.3
+pandas==2.0.3
+scipy==1.11.1
+
+# ML & Training
+scikit-learn==1.3.0
+xgboost==2.0.0
+joblib==1.3.1
+
+# Communication & Async
+pyzmq==25.0.0
+aiohttp==3.8.5
+asyncio-contextmanager==1.0.0
+
+# MLflow & Prefect (MLops)
+mlflow==2.7.0
+prefect==2.13.0
+prefect-shell==0.2.0
+
+# Database & Caching
+psycopg2-binary==2.9.7
+redis==5.0.0
+sqlalchemy==2.0.21
+
+# Monitoring & Logging
+prometheus-client==0.17.1
+python-json-logger==2.0.7
+
+# Time handling
+pytz==2025.7
+python-dateutil==2.8.2
+
+# Configuration
+python-dotenv==1.0.0
+pydantic==2.3.0
+
+# API & Docs
+fastapi==0.103.0
+uvicorn==0.23.2
+pydantic-settings==2.0.3
+
+# Utilities
+requests==2.31.0
+click==8.1.7
+colorama==0.4.6
+
+# Testing
+pytest==7.4.2
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Optional Deep Learning (uncomment to use)
+# tensorflow==2.13.0
+# torch==2.0.0
