@@ -22,6 +22,8 @@ except ImportError:
 
 from .ml_models.feature_engineer import FeatureEngineer, FeatureConfig, DataValidator, LabelGenerator
 from .ml_models.training_pipeline import MLTrainingPipeline, ModelConfig
+from .ml_models.xgb_trainer import XGBoostTradingModel
+from .backtest.backtest_engine import BacktestEngine
 from .mql5_bridge.zeromq_bridge import MT5ZeroMQBridge
 
 logger = logging.getLogger(__name__)
@@ -139,8 +141,54 @@ if PREFECT_AVAILABLE:
             'n_samples': X.shape[0],
             'n_features': X.shape[1]
         }
-    
-    
+
+
+    @task
+    def train_xgb_model(df: pd.DataFrame, symbol: str, timeframe: str, model_dir: str = "models") -> Dict:
+        """Train and save an XGBoost model using the latest XGB training module."""
+        logger = get_run_logger()
+
+        model = XGBoostTradingModel(symbol=symbol, timeframe=timeframe)
+        X, y, _ = model.prepare_data(df)
+
+        logger.info(f"Training XGBoost on {len(X)} samples")
+        metrics = model.train(X, y, optimize=True)
+
+        model_dir_path = Path(model_dir)
+        model_dir_path.mkdir(parents=True, exist_ok=True)
+        model_path = model_dir_path / f"xgb_{symbol}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.joblib"
+        model.save(str(model_path))
+
+        logger.info(f"XGBoost model saved to {model_path}")
+        return {
+            'model_path': str(model_path),
+            'metrics': metrics
+        }
+
+
+    @task
+    def backtest_with_risk(df: pd.DataFrame, model_path: str, phase: str, starting_balance: float = 100.0) -> Dict:
+        """Backtest using the same risk rules as the live system."""
+        logger = get_run_logger()
+
+        model = XGBoostTradingModel()
+        model.load(model_path)
+
+        engine = BacktestEngine(model=model, starting_balance=starting_balance, phase=phase)
+        result = engine.simulate(df)
+
+        logger.info(f"Backtest complete: return={result.total_return:.2%}, win_rate={result.win_rate:.2%}")
+
+        return {
+            'total_return': result.total_return,
+            'win_rate': result.win_rate,
+            'sharpe': result.sharpe,
+            'max_drawdown': result.max_drawdown,
+            'profit_factor': result.profit_factor,
+            'trades': len(result.trades)
+        }
+
+
     @task
     def backtest_model(df: pd.DataFrame, train_result: Dict, config: ModelConfig) -> Dict:
         """Walk-forward backtest"""
@@ -227,57 +275,75 @@ if PREFECT_AVAILABLE:
     
     # ==================== FLOWS ====================
     
+    @task
+    def evaluate_xgb_performance(train_metrics: Dict, backtest_metrics: Dict) -> Dict:
+        """Evaluate training and backtest metrics for production readiness."""
+        logger = get_run_logger()
+
+        train_f1 = train_metrics.get('test_f1', 0)
+        win_rate = backtest_metrics.get('win_rate', 0)
+        total_return = backtest_metrics.get('total_return', 0)
+
+        is_good = (train_f1 > 0.55) and (win_rate > 0.45) and (total_return > 0)
+
+        logger.info(f"Train F1={train_f1:.4f}, WinRate={win_rate:.2%}, Return={total_return:.2%}")
+        logger.info(f"Production ready: {is_good}")
+
+        return {
+            'is_good': is_good,
+            'train_f1': train_f1,
+            'win_rate': win_rate,
+            'total_return': total_return,
+            'score': (train_f1 + win_rate) / 2
+        }
+
+
     @flow(name="ml-model-retraining", description="Automated ML model retraining pipeline")
     def retrain_model_flow(symbol: str = "EURUSD",
                           timeframe: str = "H1",
-                          lookback_days: int = 730) -> Dict:
+                          lookback_days: int = 730,
+                          starting_balance: float = 100.0,
+                          phase: str = "MICRO") -> Dict:
         """Main retraining flow"""
-        
+
         logger = get_run_logger()
         logger.info(f"Starting retraining for {symbol}")
-        
-        # Configuration
-        config = ModelConfig(
-            symbol=symbol,
-            timeframe=timeframe,
-            lookback_days=lookback_days,
-            model_type="random_forest"
-        )
-        
+
         feature_config = FeatureConfig(lookback_period=50)
-        
+
         # Step 1: Extract data
         raw_data = extract_mt5_data(symbol, timeframe, lookback_days)
-        
+
         # Step 2: Validate
         validation = validate_data(raw_data, symbol)
-        
+
         # Step 3: Feature engineering
         features_df = engineer_features(raw_data, feature_config)
-        
+
         # Step 4: Labeling
         labels_df = prepare_labels(features_df)
-        
-        # Step 5: Training
-        train_result = train_ml_model(labels_df, config)
-        
-        # Step 6: Backtesting
-        backtest_result = backtest_model(labels_df, train_result, config)
-        
+
+        # Step 5: XGBoost training
+        train_result = train_xgb_model(labels_df, symbol, timeframe)
+
+        # Step 6: Backtesting (risk-managed)
+        backtest_result = backtest_with_risk(labels_df, train_result['model_path'], phase, starting_balance)
+
         # Step 7: Evaluation
-        eval_result = evaluate_performance(train_result, backtest_result)
-        
+        eval_result = evaluate_xgb_performance(train_result['metrics'], backtest_result)
+
         # Step 8: Registration
         registration_result = register_model(train_result, eval_result, symbol)
-        
+
         # Step 9: Deployment
         deployed = deploy_to_bot(registration_result)
-        
+
         return {
             "status": "success",
             "symbol": symbol,
             "train_f1": eval_result['train_f1'],
-            "backtest_f1": eval_result['backtest_f1'],
+            "win_rate": eval_result['win_rate'],
+            "total_return": eval_result['total_return'],
             "registered": registration_result is not None,
             "deployed": deployed,
             "model_path": train_result['model_path']
