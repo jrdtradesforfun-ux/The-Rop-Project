@@ -261,7 +261,329 @@ class TelegramAlertHandler:
             logger.error(f"Telegram alert failed: {e}")
 
 
-class PerformanceMonitor:
+class SMSAlertHandler:
+    """Send alerts via SMS using Twilio"""
+
+    def __init__(self, account_sid: str, auth_token: str, from_number: str, to_numbers: List[str]):
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+        self.from_number = from_number
+        self.to_numbers = to_numbers
+
+        try:
+            from twilio.rest import Client
+            self.twilio_client = Client(account_sid, auth_token)
+            self.twilio_available = True
+        except ImportError:
+            logger.warning("Twilio not installed. SMS alerts disabled.")
+            self.twilio_available = False
+
+    async def __call__(self, alert: Dict):
+        """Send alert via SMS"""
+        if not self.twilio_available:
+            logger.warning("Twilio not available for SMS alerts")
+            return
+
+        try:
+            level_emoji = {
+                'info': 'ℹ️',
+                'warning': '⚠️',
+                'error': '🚨',
+                'critical': '🛑'
+            }
+
+            emoji = level_emoji.get(alert['level'], 'ℹ️')
+
+            # SMS messages need to be concise
+            message = f"{emoji}[{alert['level'].upper()}] {alert['rule_name']}: {alert['message']}"
+
+            # Truncate if too long for SMS
+            if len(message) > 160:
+                message = message[:157] + "..."
+
+            for to_number in self.to_numbers:
+                try:
+                    self.twilio_client.messages.create(
+                        body=message,
+                        from_=self.from_number,
+                        to=to_number
+                    )
+                    logger.info(f"SMS alert sent to {to_number}")
+                except Exception as e:
+                    logger.error(f"Failed to send SMS to {to_number}: {e}")
+
+        except Exception as e:
+            logger.error(f"SMS alert failed: {e}")
+
+
+class MultiChannelAlertHandler:
+    """Handle alerts across multiple channels (Telegram, SMS, Email)"""
+
+    def __init__(self, telegram_handler=None, sms_handler=None, email_handler=None):
+        self.handlers = []
+        if telegram_handler:
+            self.handlers.append(telegram_handler)
+        if sms_handler:
+            self.handlers.append(sms_handler)
+        if email_handler:
+            self.handlers.append(email_handler)
+
+    async def __call__(self, alert: Dict):
+        """Send alert to all configured channels"""
+        tasks = []
+        for handler in self.handlers:
+            if asyncio.iscoroutinefunction(handler):
+                tasks.append(handler(alert))
+            else:
+                # Run sync handlers in thread pool
+                import concurrent.futures
+                loop = asyncio.get_event_loop()
+                tasks.append(loop.run_in_executor(None, handler, alert))
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class EmailAlertHandler:
+    """Send alerts via email"""
+
+    def __init__(self, smtp_server: str, smtp_port: int, username: str, password: str,
+                 from_email: str, to_emails: List[str]):
+        self.smtp_server = smtp_server
+        self.smtp_port = smtp_port
+        self.username = username
+        self.password = password
+        self.from_email = from_email
+        self.to_emails = to_emails
+
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            self.email_available = True
+        except ImportError:
+            logger.warning("Email libraries not available. Email alerts disabled.")
+            self.email_available = False
+
+    async def __call__(self, alert: Dict):
+        """Send alert via email"""
+        if not self.email_available:
+            return
+
+        try:
+            import smtplib
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+
+            # Create message
+            msg = MIMEMultipart()
+            msg['From'] = self.from_email
+            msg['To'] = ', '.join(self.to_emails)
+            msg['Subject'] = f"Trading Alert: {alert['rule_name']} [{alert['level'].upper()}]"
+
+            # HTML body
+            html_body = f"""
+            <html>
+            <body>
+                <h2 style="color: {'red' if alert['level'] == 'critical' else 'orange' if alert['level'] == 'error' else 'blue'};">
+                    {alert['level'].upper()} Alert: {alert['rule_name']}
+                </h2>
+                <p><strong>Message:</strong> {alert['message']}</p>
+                <p><strong>Value:</strong> {alert['value']}</p>
+                <p><strong>Time:</strong> {alert['timestamp']}</p>
+                <hr>
+                <p><small>This is an automated alert from Jaredis Smart Trading Bot</small></p>
+            </body>
+            </html>
+            """
+
+            msg.attach(MIMEText(html_body, 'html'))
+
+            # Send email
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port)
+            server.starttls()
+            server.login(self.username, self.password)
+            text = msg.as_string()
+            server.sendmail(self.from_email, self.to_emails, text)
+            server.quit()
+
+            logger.info(f"Email alert sent to {len(self.to_emails)} recipients")
+
+        except Exception as e:
+            logger.error(f"Email alert failed: {e}")
+
+
+class AlertEscalationManager:
+    """Escalate alerts based on severity and persistence"""
+
+    def __init__(self, alert_manager: AlertManager):
+        self.alert_manager = alert_manager
+        self.escalation_rules = {
+            AlertLevel.WARNING: {
+                'threshold': 3,  # 3 warnings trigger escalation
+                'escalate_to': AlertLevel.ERROR,
+                'time_window': 3600  # 1 hour window
+            },
+            AlertLevel.ERROR: {
+                'threshold': 2,  # 2 errors trigger escalation
+                'escalate_to': AlertLevel.CRITICAL,
+                'time_window': 1800  # 30 minutes window
+            }
+        }
+        self.alert_counts: Dict[str, List[datetime]] = {}
+
+    def check_escalation(self, alert: Dict):
+        """Check if alert should be escalated"""
+        rule_name = alert['rule_name']
+        level = AlertLevel(alert['level'])
+        now = datetime.now()
+
+        if level not in self.escalation_rules:
+            return
+
+        rule = self.escalation_rules[level]
+
+        # Track alert timestamps
+        if rule_name not in self.alert_counts:
+            self.alert_counts[rule_name] = []
+
+        # Remove old alerts outside time window
+        cutoff = now - timedelta(seconds=rule['time_window'])
+        self.alert_counts[rule_name] = [
+            ts for ts in self.alert_counts[rule_name] if ts > cutoff
+        ]
+
+        # Add current alert
+        self.alert_counts[rule_name].append(now)
+
+        # Check if threshold exceeded
+        if len(self.alert_counts[rule_name]) >= rule['threshold']:
+            escalated_alert = alert.copy()
+            escalated_alert['level'] = rule['escalate_to'].value
+            escalated_alert['rule_name'] = f"ESCALATED: {rule_name}"
+            escalated_alert['message'] = f"ESCALATED: {alert['message']} (occurred {len(self.alert_counts[rule_name])} times)"
+
+            # Trigger escalated alert
+            asyncio.create_task(self._trigger_escalated_alert(escalated_alert))
+
+    async def _trigger_escalated_alert(self, alert: Dict):
+        """Trigger escalated alert"""
+        logger.critical(f"ESCALATED ALERT: {alert['message']}")
+
+        # Send to all handlers
+        for handler in self.alert_manager.alert_handlers:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(alert)
+                else:
+                    handler(alert)
+            except Exception as e:
+                logger.error(f"Escalated alert handler failed: {e}")
+
+
+class AlertDashboard:
+    """Web dashboard for viewing alerts and metrics"""
+
+    def __init__(self, alert_manager: AlertManager, metrics_collector: MetricsCollector):
+        self.alert_manager = alert_manager
+        self.metrics_collector = metrics_collector
+        self.app = None
+
+    def create_dashboard(self):
+        """Create Flask dashboard app"""
+        try:
+            from flask import Flask, jsonify, render_template_string
+
+            self.app = Flask(__name__)
+
+            @self.app.route('/')
+            def dashboard():
+                return render_template_string(self._get_dashboard_html())
+
+            @self.app.route('/api/alerts')
+            def get_alerts():
+                return jsonify(self.alert_manager.alert_history[-50:])  # Last 50 alerts
+
+            @self.app.route('/api/metrics')
+            def get_metrics():
+                if PROMETHEUS_AVAILABLE:
+                    return generate_latest()
+                return jsonify({})
+
+            return self.app
+
+        except ImportError:
+            logger.warning("Flask not available. Dashboard disabled.")
+            return None
+
+    def _get_dashboard_html(self) -> str:
+        """Get HTML template for dashboard"""
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Jaredis Trading Alerts Dashboard</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .alert { padding: 10px; margin: 5px 0; border-radius: 5px; }
+                .info { background-color: #e3f2fd; }
+                .warning { background-color: #fff3e0; }
+                .error { background-color: #ffebee; }
+                .critical { background-color: #fce4ec; }
+                .metric { display: inline-block; margin: 10px; padding: 10px; background: #f5f5f5; border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <h1>Jaredis Smart Trading Bot - Alert Dashboard</h1>
+
+            <h2>Recent Alerts</h2>
+            <div id="alerts"></div>
+
+            <h2>Key Metrics</h2>
+            <div id="metrics"></div>
+
+            <script>
+                function updateAlerts() {
+                    fetch('/api/alerts')
+                        .then(r => r.json())
+                        .then(alerts => {
+                            const container = document.getElementById('alerts');
+                            container.innerHTML = alerts.map(alert => `
+                                <div class="alert ${alert.level}">
+                                    <strong>${alert.level.toUpperCase()}</strong> ${alert.rule_name}<br>
+                                    ${alert.message}<br>
+                                    <small>${alert.timestamp}</small>
+                                </div>
+                            `).join('');
+                        });
+                }
+
+                function updateMetrics() {
+                    fetch('/api/metrics')
+                        .then(r => r.text())
+                        .then(metrics => {
+                            const container = document.getElementById('metrics');
+                            // Parse Prometheus format and display key metrics
+                            container.innerHTML = '<p>Metrics loading...</p>';
+                        });
+                }
+
+                setInterval(updateAlerts, 5000);
+                setInterval(updateMetrics, 10000);
+                updateAlerts();
+                updateMetrics();
+            </script>
+        </body>
+        </html>
+        """
+
+    def run_dashboard(self, host='0.0.0.0', port=8080):
+        """Run the dashboard server"""
+        if self.app:
+            logger.info(f"Starting alert dashboard on {host}:{port}")
+            self.app.run(host=host, port=port, debug=False)
+        else:
+            logger.error("Dashboard not available - Flask not installed")
     """Monitor trading performance metrics"""
     
     def __init__(self):

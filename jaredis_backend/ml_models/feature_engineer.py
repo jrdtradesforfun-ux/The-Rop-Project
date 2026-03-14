@@ -143,9 +143,10 @@ class FeatureEngineer:
         df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / sma_20
         df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
         
-        # Volatility regime
+        # Volatility regime (numeric encoding)
         df['volatility_ma'] = df['volatility_20'].rolling(window=20).mean()
-        df['volatility_regime'] = pd.cut(df['volatility_20'], bins=3, labels=['low', 'medium', 'high'])
+        df['volatility_regime'] = pd.cut(df['volatility_20'], bins=3, labels=[0, 1, 2])
+        df['volatility_regime'] = df['volatility_regime'].astype(float).fillna(0)
         
         return df
     
@@ -228,7 +229,8 @@ class FeatureEngineer:
         """Calculate On-Balance Volume"""
         obv = np.where(close > close.shift(1), volume, 
                np.where(close < close.shift(1), -volume, 0))
-        return pd.Series(obv).cumsum()
+        # Ensure alignment with the original index to avoid NaNs on assignment
+        return pd.Series(obv, index=close.index).cumsum()
 
 
 class DataValidator:

@@ -29,17 +29,22 @@ from jaredis_backend.mql5_bridge.zeromq_bridge import (
 @pytest.fixture
 def sample_ohlcv_data():
     """Generate sample OHLCV data"""
-    dates = pd.date_range(start='2023-01-01', periods=500, freq='H')
+    dates = pd.date_range(start='2023-01-01', periods=500, freq='h')
     close = 1.0750 + np.random.randn(500).cumsum() * 0.0001
-    
+
+    # Ensure OHLC consistency (high >= max(open, close), low <= min(open, close))
+    open_ = close + np.random.randn(500) * 0.00005
+    high = np.maximum(open_, close) + np.abs(np.random.randn(500) * 0.0001)
+    low = np.minimum(open_, close) - np.abs(np.random.randn(500) * 0.0001)
+
     df = pd.DataFrame({
-        'open': close + np.random.randn(500) * 0.00005,
-        'high': close + np.abs(np.random.randn(500) * 0.0001),
-        'low': close - np.abs(np.random.randn(500) * 0.0001),
+        'open': open_,
+        'high': high,
+        'low': low,
         'close': close,
         'volume': np.random.randint(1000, 10000, 500)
     }, index=dates)
-    
+
     return df
 
 

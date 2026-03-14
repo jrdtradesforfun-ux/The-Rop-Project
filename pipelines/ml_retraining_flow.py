@@ -24,6 +24,7 @@ from .ml_models.feature_engineer import FeatureEngineer, FeatureConfig, DataVali
 from .ml_models.training_pipeline import MLTrainingPipeline, ModelConfig
 from .ml_models.xgb_trainer import XGBoostTradingModel
 from .backtest.backtest_engine import BacktestEngine
+from .backtest.walk_forward_backtester import WalkForwardBacktester
 from .mql5_bridge.zeromq_bridge import MT5ZeroMQBridge
 
 logger = logging.getLogger(__name__)
@@ -257,17 +258,40 @@ if PREFECT_AVAILABLE:
     
     
     @task
-    def deploy_to_bot(registration_result: Optional[str]) -> bool:
-        """Deploy model to live bot if registration successful"""
+    def deploy_to_bot(model_path: str, eval_result: Dict) -> bool:
+        """Deploy model to live bot if metrics are good"""
         logger = get_run_logger()
         
-        if not registration_result:
+        if not eval_result.get('is_good', False):
+            logger.info("Model metrics not good enough for deployment")
             return False
         
         try:
-            # Trigger bot reload via HTTP/signal
-            logger.info("Model deployed to bot")
+            # Load the trained model
+            model = XGBoostTradingModel.load_model(model_path)
+            
+            # Save to bot's model directory
+            import os
+            from pathlib import Path
+            
+            bot_model_dir = Path("models/live")
+            bot_model_dir.mkdir(exist_ok=True)
+            live_model_path = bot_model_dir / "xgboost_trading_model.pkl"
+            
+            model.save_model(str(live_model_path))
+            
+            # Create deployment signal file
+            signal_file = bot_model_dir / "model_updated.signal"
+            with open(signal_file, 'w') as f:
+                f.write(f"Model updated at {datetime.now().isoformat()}\n")
+                f.write(f"Path: {live_model_path}\n")
+                f.write(f"F1 Score: {eval_result.get('train_f1', 0):.4f}\n")
+                f.write(f"Win Rate: {eval_result.get('win_rate', 0):.2%}\n")
+            
+            logger.info(f"Model deployed to {live_model_path}")
+            logger.info("Bot will reload model on next cycle")
             return True
+            
         except Exception as e:
             logger.error(f"Deployment failed: {e}")
             return False
@@ -276,26 +300,89 @@ if PREFECT_AVAILABLE:
     # ==================== FLOWS ====================
     
     @task
-    def evaluate_xgb_performance(train_metrics: Dict, backtest_metrics: Dict) -> Dict:
+    def walk_forward_backtest(labels_df: pd.DataFrame, phase: str = "MICRO") -> Dict:
+        """Run walk-forward backtest for more realistic evaluation"""
+        logger = get_run_logger()
+        
+        try:
+            backtester = WalkForwardBacktester(
+                train_window_months=6,
+                test_window_months=1,
+                step_months=1,
+                phase=phase,
+                parallel=True
+            )
+            
+            result = backtester.run_walk_forward(labels_df)
+            
+            logger.info(f"Walk-forward complete: {result.num_windows} windows")
+            logger.info(f"Overall return: {result.total_return:.2%}, Win rate: {result.win_rate:.1%}")
+            
+            return {
+                'total_return': result.total_return,
+                'win_rate': result.win_rate,
+                'profit_factor': result.profit_factor,
+                'sharpe_ratio': result.sharpe_ratio,
+                'max_drawdown': result.max_drawdown,
+                'num_windows': result.num_windows,
+                'avg_window_return': result.avg_window_return,
+                'is_good': result.win_rate > 0.45 and result.total_return > 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Walk-forward backtest failed: {e}")
+            return {'error': str(e), 'is_good': False}
+
+
+    @task
+    def evaluate_xgb_performance(train_metrics: Dict, backtest_metrics: Dict, wf_metrics: Optional[Dict] = None) -> Dict:
         """Evaluate training and backtest metrics for production readiness."""
         logger = get_run_logger()
 
         train_f1 = train_metrics.get('test_f1', 0)
-        win_rate = backtest_metrics.get('win_rate', 0)
-        total_return = backtest_metrics.get('total_return', 0)
+        single_win_rate = backtest_metrics.get('win_rate', 0)
+        single_return = backtest_metrics.get('total_return', 0)
+        
+        # Use walk-forward if available, otherwise single backtest
+        if wf_metrics and not wf_metrics.get('error'):
+            win_rate = wf_metrics.get('win_rate', 0)
+            total_return = wf_metrics.get('total_return', 0)
+            backtest_type = "walk_forward"
+        else:
+            win_rate = single_win_rate
+            total_return = single_return
+            backtest_type = "single_window"
 
-        is_good = (train_f1 > 0.55) and (win_rate > 0.45) and (total_return > 0)
+        # Stricter criteria for walk-forward
+        if backtest_type == "walk_forward":
+            is_good = (train_f1 > 0.55) and (win_rate > 0.50) and (total_return > 0.05)
+        else:
+            is_good = (train_f1 > 0.55) and (win_rate > 0.45) and (total_return > 0)
 
-        logger.info(f"Train F1={train_f1:.4f}, WinRate={win_rate:.2%}, Return={total_return:.2%}")
+        logger.info(f"Train F1={train_f1:.4f}, Backtest Type={backtest_type}")
+        logger.info(f"WinRate={win_rate:.2%}, Return={total_return:.2%}")
         logger.info(f"Production ready: {is_good}")
 
-        return {
+        result = {
             'is_good': is_good,
             'train_f1': train_f1,
+            'single_win_rate': single_win_rate,
             'win_rate': win_rate,
             'total_return': total_return,
+            'backtest_type': backtest_type,
             'score': (train_f1 + win_rate) / 2
         }
+        
+        if wf_metrics and not wf_metrics.get('error'):
+            result.update({
+                'wf_win_rate': wf_metrics.get('win_rate', 0),
+                'wf_total_return': wf_metrics.get('total_return', 0),
+                'wf_sharpe': wf_metrics.get('sharpe_ratio', 0),
+                'wf_max_dd': wf_metrics.get('max_drawdown', 0),
+                'wf_windows': wf_metrics.get('num_windows', 0)
+            })
+        
+        return result
 
 
     @flow(name="ml-model-retraining", description="Automated ML model retraining pipeline")
@@ -326,24 +413,28 @@ if PREFECT_AVAILABLE:
         # Step 5: XGBoost training
         train_result = train_xgb_model(labels_df, symbol, timeframe)
 
-        # Step 6: Backtesting (risk-managed)
+        # Step 6: Single-window backtesting
         backtest_result = backtest_with_risk(labels_df, train_result['model_path'], phase, starting_balance)
 
-        # Step 7: Evaluation
-        eval_result = evaluate_xgb_performance(train_result['metrics'], backtest_result)
+        # Step 7: Walk-forward backtesting
+        wf_result = walk_forward_backtest(labels_df, phase)
 
-        # Step 8: Registration
+        # Step 8: Evaluation (combine both backtest results)
+        eval_result = evaluate_xgb_performance(train_result['metrics'], backtest_result, wf_result)
+
+        # Step 9: Registration
         registration_result = register_model(train_result, eval_result, symbol)
 
-        # Step 9: Deployment
-        deployed = deploy_to_bot(registration_result)
+        # Step 10: Deployment
+        deployed = deploy_to_bot(train_result['model_path'], eval_result)
 
         return {
             "status": "success",
             "symbol": symbol,
             "train_f1": eval_result['train_f1'],
-            "win_rate": eval_result['win_rate'],
-            "total_return": eval_result['total_return'],
+            "single_win_rate": eval_result['single_win_rate'],
+            "wf_win_rate": eval_result.get('wf_win_rate', 0),
+            "wf_total_return": eval_result.get('wf_total_return', 0),
             "registered": registration_result is not None,
             "deployed": deployed,
             "model_path": train_result['model_path']
@@ -359,18 +450,17 @@ if PREFECT_AVAILABLE:
         
         # Get live metrics from bot
         try:
-            # This would connect to your bot's API
-            win_rate = 0.55  # Placeholder
-            sharpe_ratio = 1.2  # Placeholder
+            # Check for performance drift
+            drift_detected = check_performance_drift(symbol)
             
-            if win_rate < 0.45 or sharpe_ratio < 0.5:
-                logger.warning("Performance degraded. Triggering retraining...")
+            if drift_detected:
+                logger.warning("Performance drift detected. Triggering retraining...")
                 return retrain_model_flow(symbol)
             else:
                 return {
                     "status": "healthy",
-                    "win_rate": win_rate,
-                    "sharpe_ratio": sharpe_ratio
+                    "drift_detected": False,
+                    "last_check": datetime.now().isoformat()
                 }
                 
         except Exception as e:
@@ -378,7 +468,35 @@ if PREFECT_AVAILABLE:
             return {"status": "error", "message": str(e)}
 
 
-else:
+    @task
+    def check_performance_drift(symbol: str) -> bool:
+        """Check for performance drift that requires retraining"""
+        logger = get_run_logger()
+        
+        try:
+            # Check signal file for recent model updates
+            from pathlib import Path
+            signal_file = Path("models/live/model_updated.signal")
+            
+            if signal_file.exists():
+                # Read last update time
+                with open(signal_file, 'r') as f:
+                    lines = f.readlines()
+                    if lines:
+                        update_time_str = lines[0].split("at ")[-1].strip()
+                        update_time = datetime.fromisoformat(update_time_str)
+                        
+                        # If model is older than 30 days, check performance
+                        if (datetime.now() - update_time).days > 30:
+                            logger.info("Model is 30+ days old, checking performance...")
+                            return True
+            
+            # Check for external drift signals (market regime change, etc.)
+            return False
+            
+        except Exception as e:
+            logger.error(f"Drift check failed: {e}")
+            return False
     # Fallback implementation without Prefect
     class SimpleMLOpsScheduler:
         """Simple scheduler when Prefect is not available"""

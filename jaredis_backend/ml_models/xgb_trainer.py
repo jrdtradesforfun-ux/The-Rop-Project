@@ -58,6 +58,12 @@ try:
 except ImportError:  # pragma: no cover
     xgb = None  # type: ignore
 
+try:
+    from .gpu_utils import gpu_manager, get_optimal_config, optimize_memory
+    _HAS_GPU_UTILS = True
+except ImportError:
+    _HAS_GPU_UTILS = False
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -187,8 +193,9 @@ class XGBoostTradingModel:
         if self.target_type == "directional":
             future_return = df['close'].shift(-self.prediction_horizon) / df['close'] - 1
             labels = pd.Series(0, index=df.index)
-            labels[future_return > 0.001] = 1
-            labels[future_return < -0.001] = -1
+            labels[future_return > 0.001] = 2  # Long
+            labels[future_return < -0.001] = 1  # Short
+            # 0 = Neutral/Hold
         elif self.target_type == "triple_barrier":
             labels = self._triple_barrier_labels(df)
         elif self.target_type == "returns":
@@ -292,7 +299,29 @@ class XGBoostTradingModel:
         class_weight_dict = dict(zip(classes, weights))
 
         if optimize or not self.best_params:
-            self.optimize_hyperparameters(X_train, y_train, n_trials=50)
+            try:
+                self.optimize_hyperparameters(X_train, y_train, n_trials=50)
+            except RuntimeError as e:
+                if "optuna" in str(e):
+                    logger.warning("Optuna not available, using default XGBoost parameters")
+                    self.best_params = {
+                        'max_depth': 6,
+                        'learning_rate': 0.1,
+                        'n_estimators': 100,
+                        'subsample': 0.8,
+                        'colsample_bytree': 0.8,
+                        'min_child_weight': 1
+                    }
+                else:
+                    raise
+
+        # Get GPU configuration if available
+        gpu_config = {}
+        if use_gpu and _HAS_GPU_UTILS:
+            gpu_config = get_optimal_config('xgboost')
+            logger.info(f"Using GPU configuration: {gpu_config}")
+        elif use_gpu:
+            logger.warning("GPU utils not available, falling back to CPU")
 
         params: Dict = {
             **self.best_params,
@@ -300,17 +329,24 @@ class XGBoostTradingModel:
             'num_class': len(classes),
             'eval_metric': 'mlogloss',
             'random_state': 42,
-            'n_jobs': -1
+            **gpu_config  # Apply GPU config
         }
 
+        # Override CPU settings if GPU is enabled
         if use_gpu:
-            params['tree_method'] = 'gpu_hist'
+            params['n_jobs'] = 1  # GPU handles parallelism
+        else:
+            params['n_jobs'] = -1  # Use all CPU cores
 
         self.model = xgb.XGBClassifier(**params)
+
+        # Optimize memory before training
+        if _HAS_GPU_UTILS:
+            optimize_memory()
+
         self.model.fit(
             X_train_s, y_train,
             eval_set=[(X_test_s, y_test)],
-            early_stopping_rounds=50,
             verbose=False
         )
 
@@ -323,7 +359,8 @@ class XGBoostTradingModel:
             'test_f1': f1_score(y_test, test_pred, average='weighted'),
             'test_precision': precision_score(y_test, test_pred, average='weighted', zero_division=0),
             'test_recall': recall_score(y_test, test_pred, average='weighted', zero_division=0),
-            'best_iteration': getattr(self.model, 'best_iteration', None)
+            'best_iteration': getattr(self.model, 'best_iteration', None),
+            'gpu_used': use_gpu and bool(gpu_config)
         }
 
         logger.info(f"Training complete: {self.training_metrics}")
@@ -521,6 +558,16 @@ class LSTMTradingModel:
         if not _HAS_TF:
             raise RuntimeError("TensorFlow is required for LSTM training")
 
+        # Get GPU configuration
+        gpu_config = {}
+        if _HAS_GPU_UTILS:
+            gpu_config = get_optimal_config('tensorflow')
+            logger.info(f"Using TensorFlow GPU configuration: {gpu_config}")
+
+            # Adjust batch size based on GPU memory
+            if 'strategy' in gpu_config:
+                batch_size = min(batch_size, gpu_manager.optimal_batch_size)
+
         X_seq, y_seq = self.create_sequences(X.values, y.values)
         y_seq = y_seq + 1
         y_cat = tf.keras.utils.to_categorical(y_seq, num_classes=3)
@@ -533,11 +580,23 @@ class LSTMTradingModel:
         X_test_reshaped = X_test.reshape(-1, n_features)
         X_test_scaled = self.scaler.transform(X_test_reshaped).reshape(-1, n_timesteps, n_features)
         self.model = self.build_model(n_features)
+
+        # Use GPU strategy if available
+        strategy = gpu_config.get('strategy')
+        if strategy:
+            with strategy.scope():
+                self.model = self.build_model(n_features)
+
         callbacks = [
             tf.keras.callbacks.EarlyStopping(monitor='val_f1_score', patience=15, restore_best_weights=True, mode='max'),
             tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-5),
             tf.keras.callbacks.ModelCheckpoint(f'models/lstm_{self.symbol}_best.h5', monitor='val_f1_score', save_best_only=True, mode='max')
         ]
+
+        # Optimize memory before training
+        if _HAS_GPU_UTILS:
+            optimize_memory()
+
         history = self.model.fit(
             X_train_scaled, y_train,
             validation_data=(X_test_scaled, y_test),
@@ -551,7 +610,9 @@ class LSTMTradingModel:
             'test_accuracy': test_acc,
             'test_f1': test_f1,
             'final_epoch': len(history.history['loss']),
-            'history': history.history
+            'history': history.history,
+            'gpu_used': bool(gpu_config),
+            'batch_size': batch_size
         }
 
     def predict(self, X_recent: pd.DataFrame) -> pd.DataFrame:

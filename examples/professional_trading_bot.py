@@ -104,6 +104,41 @@ class ProfessionalTradingBot:
 
         self.logger.info(f"Ensemble ready with {len(self.ensemble.models)} models")
 
+    def check_for_model_updates(self) -> bool:
+        """Check for model updates from the retraining pipeline"""
+        try:
+            from pathlib import Path
+            signal_file = Path("models/live/model_updated.signal")
+            
+            if signal_file.exists():
+                # Read signal file
+                with open(signal_file, 'r') as f:
+                    lines = f.readlines()
+                    if len(lines) >= 2:
+                        model_path_line = lines[1]
+                        model_path = model_path_line.split("Path: ")[-1].strip()
+                        
+                        # Load the new model
+                        from jaredis_backend.ml_models.xgb_trainer import XGBoostTradingModel
+                        new_model = XGBoostTradingModel.load_model(model_path)
+                        
+                        # Replace in ensemble
+                        success = self.ensemble.replace_model("xgboost", new_model)
+                        
+                        if success:
+                            self.logger.info(f"Successfully updated XGBoost model from {model_path}")
+                            # Remove signal file to avoid reprocessing
+                            signal_file.unlink()
+                            return True
+                        else:
+                            self.logger.warning("Failed to replace model in ensemble")
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error checking for model updates: {e}")
+            return False
+
     def generate_features(self, symbol: str, bars: int = 100) -> pd.DataFrame:
         """Generate ML features from market data"""
         try:
@@ -246,6 +281,9 @@ class ProfessionalTradingBot:
 
         try:
             while self.running:
+                # Check for model updates
+                self.check_for_model_updates()
+                
                 # Check elapsed time
                 elapsed = (datetime.now() - start_time).total_seconds() / 60
                 if elapsed > duration_minutes:

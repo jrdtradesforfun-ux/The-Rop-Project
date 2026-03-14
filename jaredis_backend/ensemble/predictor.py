@@ -41,6 +41,35 @@ class EnsemblePredictor:
         self.total_weight = sum(self.model_weights.values())
         logger.info(f"Added model '{name}' to ensemble with weight {weight}")
 
+    def replace_model(
+        self,
+        name: str,
+        new_model: Any,
+        weight: Optional[float] = None
+    ) -> bool:
+        """
+        Replace an existing model in the ensemble.
+        
+        Args:
+            name: Model identifier to replace
+            new_model: New model object
+            weight: New weight (if None, keeps existing weight)
+            
+        Returns:
+            True if replaced, False if model not found
+        """
+        if name not in self.models:
+            logger.warning(f"Model '{name}' not found in ensemble")
+            return False
+            
+        self.models[name] = new_model
+        if weight is not None:
+            self.model_weights[name] = weight
+            self.total_weight = sum(self.model_weights.values())
+        
+        logger.info(f"Replaced model '{name}' in ensemble")
+        return True
+
     def predict(self, X: np.ndarray) -> Dict[str, Any]:
         """
         Generate ensemble prediction.
